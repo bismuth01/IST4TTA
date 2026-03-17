@@ -27,25 +27,30 @@ pip install -r requirements.txt
 
 ## Datasets
 
-For online test-time adaptation, we consider 7 datasets:
+For online test-time adaptation, we consider the following datasets:
 
 - CIFAR-10
-
 - CIFAR-100
-
 - Food101
-
 - StanfordCars
-
 - ImageNet
-
 - [CIFAR-10C](https://zenodo.org/records/2535967#.Yn5QwbozZhE)
-
 - [ImageNet-C](https://zenodo.org/records/2235448#.Yn5OTrozZhE)
+- [RSICD](https://huggingface.co/datasets/arampacha/rsicd)
+- [EuroSAT RGB](https://huggingface.co/datasets/blanchon/EuroSAT_RGB)
+- [RESISC45](https://huggingface.co/datasets/timm/resisc45)
+- [PatternNet](https://huggingface.co/datasets/blanchon/PatternNet)
+- [MLRSNet](https://huggingface.co/datasets/jonathan-roberts1/MLRSNet)
 
-The first five datasets will be automatically downloaded to local.
+The clean datasets loaded through `online_clip.py` will be automatically downloaded to local.
 If it failed due to network problems, please manually download from [Hugging Face](https://huggingface.co/datasets) and store in `./data/datasets/`.
 Meanwhile, you need to download CIFAR-10C and ImageNet-C to `./data/CIFAR-10-C` and `./data/ImageNet-C`.
+
+Notes for the remote sensing datasets in `online_clip.py`:
+
+- `rsicd` uses the scene name encoded in the filename as its classification target, since the Hugging Face release exposes captions instead of a dedicated class label column.
+- `mlrsnet` is treated as a multi-label dataset during evaluation, so a prediction is counted as correct when it matches any positive class for the image.
+- Recommended splits are `test` for `rsicd`, `eurosat`, and `resisc45`, and `train` for `patternnet` and `mlrsnet` because those Hugging Face releases do not provide held-out test splits.
 
 ## Run IST
 
@@ -56,6 +61,8 @@ Runing IST with CLIP models:
 ```
 bash ./scripts/online_clip.sh
 ```
+
+The CLIP script now accepts the aliases `rsicd`, `eurosat`, `resisc45`, `patternnet`, and `mlrsnet` in `--dataset`.
 
 Runing IST on CIFAR-10C and ImageNet-C:
 

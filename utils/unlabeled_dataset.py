@@ -377,10 +377,15 @@ class UnlabeledDatasetV6(UnlabeledDatasetV4):
         self.labels = []
         self.class_names = class_names
 
-        images, labels = batch['img'], batch['label']
+        images = batch['img']
+        labels = batch.get('label_targets', batch['label'])
         for image, label in zip(images, labels):
             assert isinstance(image, Image.Image)
             self.samples.append(image)
+            if isinstance(label, torch.Tensor):
+                label = label.tolist() if label.ndim > 0 else label.item()
+            if isinstance(label, np.ndarray):
+                label = label.tolist()
             self.labels.append(label)
             self._samples.extend([image] * extend)
         
@@ -404,6 +409,27 @@ class UnlabeledDatasetV6(UnlabeledDatasetV4):
             return None
         else:
             return self._pseudo_labels
+
+    def pseudo_labels_accuracy(self):
+        if dist.get_rank() == 0:
+            soft_labels = np.array(self._soft_labels)
+            pseudo_labels = np.array(self._pseudo_labels)
+
+            predict_labels = soft_labels * pseudo_labels
+            C = predict_labels.shape[-1]
+            predict_labels = predict_labels.reshape(-1, self.extend * C)
+            predict_labels = np.argmax(predict_labels, axis=-1) % C
+
+            correct = 0
+            for label, prediction in zip(self.labels, predict_labels):
+                if isinstance(label, (list, tuple, set, np.ndarray)):
+                    correct += int(prediction in label)
+                else:
+                    correct += int(label == prediction)
+
+            self.acc = correct / len(self.samples)
+            if self.verbose:
+                print(f'Accuracy of pseudo labels of curract batch: {self.acc:.4f}')
 
 
 

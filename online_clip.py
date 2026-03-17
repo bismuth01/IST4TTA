@@ -1,6 +1,7 @@
 import os
 import argparse
 import datetime
+import re
 from tqdm import tqdm
 
 import torch
@@ -49,6 +50,181 @@ parser.add_argument("--local-rank", type=int, default=-1, help='node rank for di
 args = parser.parse_args()
 
 
+DEFAULT_PROMPT_TEMPLATE = "a photo of a {}"
+REMOTE_SENSING_PROMPT_TEMPLATE = "a satellite image of {}"
+
+DATASET_CONFIGS = {
+    "arampacha/rsicd": {
+        "aliases": ["rsicd"],
+        "prompt_template": REMOTE_SENSING_PROMPT_TEMPLATE,
+    },
+    "blanchon/EuroSAT_RGB": {
+        "aliases": ["eurosat", "eurosat_rgb"],
+        "prompt_template": REMOTE_SENSING_PROMPT_TEMPLATE,
+    },
+    "timm/resisc45": {
+        "aliases": ["resisc45", "resisc-45", "nwpu-resisc45"],
+        "prompt_template": REMOTE_SENSING_PROMPT_TEMPLATE,
+    },
+    "blanchon/PatternNet": {
+        "aliases": ["patternnet"],
+        "prompt_template": REMOTE_SENSING_PROMPT_TEMPLATE,
+    },
+    "jonathan-roberts1/MLRSNet": {
+        "aliases": ["mlrsnet"],
+        "prompt_template": REMOTE_SENSING_PROMPT_TEMPLATE,
+    },
+}
+
+DATASET_ALIASES = {
+    alias: dataset_name
+    for dataset_name, config in DATASET_CONFIGS.items()
+    for alias in config["aliases"]
+}
+
+SPLIT_ALIASES = {
+    "train": ["train"],
+    "test": ["test"],
+    "validation": ["validation", "valid", "val"],
+    "valid": ["valid", "validation", "val"],
+    "val": ["val", "validation", "valid"],
+}
+
+
+def resolve_dataset_name(dataset_name):
+    return DATASET_ALIASES.get(dataset_name, dataset_name)
+
+
+def get_dataset_config(dataset_name):
+    return DATASET_CONFIGS.get(dataset_name, {})
+
+
+def resolve_split_name(split_name, available_splits):
+    if split_name in available_splits:
+        return split_name
+
+    for candidate in SPLIT_ALIASES.get(split_name, []):
+        if candidate in available_splits:
+            return candidate
+
+    raise ValueError(f"Split '{split_name}' not found. Available splits: {sorted(available_splits)}")
+
+
+def normalize_class_name(class_name):
+    return class_name.replace("_", " ").replace("-", " ").strip()
+
+
+def parse_rsicd_class_name(filename):
+    filename = os.path.basename(filename)
+    filename = os.path.splitext(filename)[0]
+    filename = re.sub(r"_\d+$", "", filename)
+    return normalize_class_name(filename)
+
+
+def infer_dataset_spec(dataset_name, dataset):
+    features = dataset.features
+
+    if "image" in features:
+        image_key = "image"
+    elif "img" in features:
+        image_key = "img"
+    else:
+        raise NotImplementedError("No image feature found in the dataset.")
+
+    if dataset_name == "arampacha/rsicd":
+        if "filename" not in features:
+            raise NotImplementedError("RSICD requires a 'filename' field to derive scene labels.")
+
+        class_names = sorted({parse_rsicd_class_name(filename) for filename in dataset["filename"]})
+        return {
+            "image_key": image_key,
+            "label_mode": "filename_prefix",
+            "class_names": class_names,
+            "label_to_index": {label: idx for idx, label in enumerate(class_names)},
+            "prompt_template": get_dataset_config(dataset_name).get("prompt_template", DEFAULT_PROMPT_TEMPLATE),
+        }
+
+    if "label" in features:
+        label_feature = features["label"]
+        label_key = "label"
+    elif "fine_label" in features:
+        label_feature = features["fine_label"]
+        label_key = "fine_label"
+    else:
+        raise NotImplementedError("No supported label feature found in the dataset.")
+
+    if hasattr(label_feature, "names"):
+        class_names = [normalize_class_name(name) for name in label_feature.names]
+        label_mode = "single_label"
+    elif hasattr(label_feature, "feature") and hasattr(label_feature.feature, "names"):
+        class_names = [normalize_class_name(name) for name in label_feature.feature.names]
+        label_mode = "multi_label"
+    else:
+        raise NotImplementedError("Unsupported label schema in the dataset.")
+
+    return {
+        "image_key": image_key,
+        "label_key": label_key,
+        "label_mode": label_mode,
+        "class_names": class_names,
+        "prompt_template": get_dataset_config(dataset_name).get("prompt_template", DEFAULT_PROMPT_TEMPLATE),
+    }
+
+
+def build_dataset_transform(preprocess, dataset_spec):
+    def dataset_transform(examples):
+        images = list(examples[dataset_spec["image_key"]])
+        examples["img"] = images
+        examples["image"] = [preprocess(image) for image in images]
+
+        if dataset_spec["label_mode"] == "single_label":
+            examples["label_targets"] = [[int(label)] for label in examples[dataset_spec["label_key"]]]
+        elif dataset_spec["label_mode"] == "multi_label":
+            examples["label_targets"] = [list(map(int, labels)) for labels in examples[dataset_spec["label_key"]]]
+        elif dataset_spec["label_mode"] == "filename_prefix":
+            examples["label_targets"] = [
+                [dataset_spec["label_to_index"][parse_rsicd_class_name(filename)]]
+                for filename in examples["filename"]
+            ]
+        else:
+            raise NotImplementedError(f"Unsupported label mode: {dataset_spec['label_mode']}")
+
+        return examples
+
+    return dataset_transform
+
+
+def load_hf_dataset(dataset_name, split_name):
+    local_candidates = [
+        os.path.join("./data/datasets", args.dataset),
+        os.path.join("./data/datasets", dataset_name),
+    ]
+
+    dataset = None
+    for source in local_candidates:
+        try:
+            dataset = load_dataset(source, split=split_name)
+            break
+        except Exception:
+            continue
+
+    if dataset is None:
+        dataset = load_dataset(dataset_name, split=split_name)
+
+    return dataset
+
+
+def build_text_inputs(class_names, prompt_template):
+    return torch.cat([clip.tokenize(prompt_template.format(class_name)) for class_name in class_names])
+
+
+def compute_accuracy(predictions, label_targets):
+    correct = 0
+    for prediction, targets in zip(predictions.tolist(), label_targets):
+        correct += int(prediction in targets)
+    return predictions.new_tensor(correct / max(len(label_targets), 1), dtype=torch.float32)
+
+
 # Initialize the environment
 if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
     rank = int(os.environ["RANK"])
@@ -92,34 +268,39 @@ model = DDP(model, device_ids=[args.local_rank], broadcast_buffers=False)
 
 # Create the datasets
 adapt_transform = build_transforms(preprocess)
-
-def test_transform(examples):
-    if "img" in examples.keys():
-        examples["image"] = examples["img"]
-    elif "image" in examples.keys():
-        examples["img"] = examples["image"]
-    examples["image"] = [preprocess(image) for image in examples["image"]]
-    if "fine_label" in examples.keys():
-        examples["label"] = examples["fine_label"]
-    return examples
+dataset_name = resolve_dataset_name(args.dataset)
 
 try:
-    train_dataset = load_dataset('./data/datasets/'+args.dataset, split=args.split)
-    test_dataset = load_dataset('./data/datasets/'+args.dataset, split=args.split)
-except:
-    train_dataset = load_dataset(args.dataset, split=args.split)
-    test_dataset = load_dataset(args.dataset, split=args.split)
+    split_dataset = load_hf_dataset(dataset_name, args.split)
+    resolved_split = args.split
+except Exception:
+    available_splits = set(load_dataset(dataset_name).keys())
+    resolved_split = resolve_split_name(args.split, available_splits)
+    split_dataset = load_hf_dataset(dataset_name, resolved_split)
+
+dataset_spec = infer_dataset_spec(dataset_name, split_dataset)
+class_names = dataset_spec["class_names"]
+text_inputs = build_text_inputs(class_names, dataset_spec["prompt_template"])
+test_transform = build_dataset_transform(preprocess, dataset_spec)
+
+train_dataset = split_dataset
+test_dataset = load_hf_dataset(dataset_name, resolved_split)
 
 train_dataset.set_transform(test_transform)
 test_dataset.set_transform(test_transform)
+
+if dist.get_rank() == 0:
+    logger.info(f"Resolved dataset source: {dataset_name}, split: {resolved_split}")
 
 
 # Create the dataloaders
 def collate_fn(examples):
     batch = {}
     batch["image"] = torch.stack([example["image"] for example in examples])
-    batch["label"] = torch.tensor([example["label"] for example in examples])
     batch["img"] = [example["img"] for example in examples]
+    batch["label_targets"] = [example["label_targets"] for example in examples]
+    if all(len(targets) == 1 for targets in batch["label_targets"]):
+        batch["label"] = torch.tensor([targets[0] for targets in batch["label_targets"]])
     return batch
 
 train_sampler = torch.utils.data.DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
@@ -151,8 +332,7 @@ def compute_pseudo_labels(dataset, preprocess, model, repeat=args.repeat, verbos
 
     def clip_predict(images, class_names):
         image_features = model.encode_image(images.to(device))
-        text = torch.cat([clip.tokenize(f"a photo of a {c}") for c in class_names])
-        text_features = model.encode_text(text.to(device))
+        text_features = model.encode_text(text_inputs.to(device))
 
         image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
@@ -190,31 +370,22 @@ def compute_pseudo_labels(dataset, preprocess, model, repeat=args.repeat, verbos
 max_acc_meter = AverageMeter()
 model.eval()
 with torch.no_grad():
-
-    if 'label' in test_dataset.features:
-        class_names = test_dataset.features['label'].names
-    elif 'fine_label' in test_dataset.features:
-        class_names = test_dataset.features['fine_label'].names
-    else:
-        raise NotImplementedError('No label information in the dataset.')
-
     tbar = tqdm(test_loader, dynamic_ncols=True) if dist.get_rank() == 0 else test_loader
     for batch in tbar:
         images = batch["image"].to(device)
-        labels = batch["label"].to(device)
+        label_targets = batch["label_targets"]
 
         image_features = model_without_ddp.encode_image(images)
-        text = torch.cat([clip.tokenize(f"a photo of a {c}") for c in class_names])
-        text_features = model_without_ddp.encode_text(text.to(device))
+        text_features = model_without_ddp.encode_text(text_inputs.to(device))
 
         image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
         text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
         soft_labels = (100.0 * image_features_norm @ text_features_norm.T).softmax(dim=-1)
 
         predictions = torch.argmax(soft_labels, dim=-1)
-        acc = torch.sum(predictions == labels) / len(labels)
+        acc = compute_accuracy(predictions, label_targets)
         acc = reduce_tensor(acc)
-        max_acc_meter.update(acc.item(), len(labels) * dist.get_world_size())
+        max_acc_meter.update(acc.item(), len(label_targets) * dist.get_world_size())
         if dist.get_rank() == 0:
             tbar.set_description(f"Target Testing  [ MM-Accuracy {max_acc_meter.val:.4f} ({max_acc_meter.avg:.4f}) ]")
 
@@ -248,8 +419,7 @@ for batch_idx, batch in enumerate(train_loader):
                 soft_labels = soft_labels.to(device)
 
                 image_features = model_without_ddp.encode_image(images)
-                text = torch.cat([clip.tokenize(f"a photo of a {c}") for c in class_names])
-                text_features = model_without_ddp.encode_text(text.to(device))
+                text_features = model_without_ddp.encode_text(text_inputs.to(device))
 
                 image_features_norm = image_features / image_features.norm(dim=-1, keepdim=True)
                 text_features_norm = text_features / text_features.norm(dim=-1, keepdim=True)
